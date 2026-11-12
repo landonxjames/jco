@@ -7,6 +7,7 @@ import {
     futureTakeValue,
     PollState,
     pollStateReady,
+    shutdownStream,
     verifyPollsDroppedForDrop,
 } from "./worker-thread.js";
 import {
@@ -29,6 +30,7 @@ import {
 } from "./worker-sockets.js";
 import { Server, Socket as TcpSocket } from "node:net";
 import { IpSocketAddress } from "../../types/interfaces/wasi-sockets-network.js";
+import { ShutdownType } from "../../types/interfaces/wasi-sockets-tcp.js";
 
 interface PendingAccept {
     tcpSocket: TcpSocket | null;
@@ -47,6 +49,9 @@ interface TcpSocketRecord {
     keepAliveIdleTime: number;
     pendingAccepts: PendingAccept[];
     pollState: PollState | null;
+    inputStreamId: number | null;
+    outputStreamId: number | null;
+    receiveShutdown: boolean;
 }
 
 export const tcpSockets: Map<number, TcpSocketRecord> = new Map();
@@ -70,6 +75,9 @@ export function createTcpSocket() {
             polls: [],
             parentStream: null,
         },
+        inputStreamId: null,
+        outputStreamId: null,
+        receiveShutdown: false,
     });
     return tcpSocketCnt;
 }
@@ -246,7 +254,9 @@ export function socketTcpConnectStart(id: number, remoteAddress: IpSocketAddress
                     localPort: localAddress?.val.port,
                 });
             });
-            return [createReadableStream(tcpSocket), createWritableStream(tcpSocket)];
+            socket.inputStreamId = createReadableStream(tcpSocket);
+            socket.outputStreamId = createWritableStream(tcpSocket);
+            return [socket.inputStreamId, socket.outputStreamId];
         })(),
         socket.pollState,
     );
@@ -277,6 +287,9 @@ export function socketTcpAccept(id: number) {
     if (socket.pollState && socket.pendingAccepts.length === 0) {
         socket.pollState.ready = false;
     }
+    // @ts-expect-error
+    const inputStreamId = createReadableStream(accept.tcpSocket, accept.pollState ?? undefined);
+    const outputStreamId = createWritableStream(accept.tcpSocket);
     tcpSockets.set(++tcpSocketCnt, {
         state: SOCKET_STATE_CONNECTION,
         future: null,
@@ -288,13 +301,11 @@ export function socketTcpAccept(id: number) {
         keepAliveIdleTime: 0,
         pendingAccepts: [],
         pollState: accept.pollState,
+        inputStreamId,
+        outputStreamId,
+        receiveShutdown: false,
     });
-    return [
-        tcpSocketCnt,
-        // @ts-expect-error
-        createReadableStream(accept.tcpSocket, accept.pollState ?? undefined),
-        createWritableStream(accept.tcpSocket),
-    ];
+    return [tcpSocketCnt, inputStreamId, outputStreamId];
 }
 
 export function socketTcpSetListenBacklogSize(id: number, backlogSize) {
@@ -332,12 +343,42 @@ export function socketTcpGetRemoteAddress(id: number) {
     return ipSocketAddress(tcpSocket.remoteFamily, tcpSocket.remoteAddress, tcpSocket.remotePort);
 }
 
-export function socketTcpShutdown(id: number, _shutdownType) {
+export function socketTcpShutdown(id: number, shutdownType: ShutdownType) {
     const socket = tcpSockets.get(id)!;
     if (socket.state !== SOCKET_STATE_CONNECTION) {
         throw "invalid-state";
     }
-    socket.tcpSocket?.destroy();
+    const tcpSocket = socket.tcpSocket!;
+
+    // Node.js cannot shut down a socket's read side, so close the input
+    // stream and keep reading from the socket to discard what arrives,
+    // including bytes that are already buffered
+    if (shutdownType !== "send" && !socket.receiveShutdown) {
+        socket.receiveShutdown = true;
+        shutdownStream(socket.inputStreamId);
+        tcpSocket.on("readable", discardInput);
+        discardInput.call(tcpSocket);
+    }
+
+    // Ending the socket sends a FIN once Node.js has written the bytes it
+    // holds. Sockets are created with `allowHalfOpen`, so the read side
+    // stays open
+    if (shutdownType !== "receive") {
+        shutdownStream(socket.outputStreamId);
+        tcpSocket.end();
+    }
+}
+
+/**
+ * Reads and drops everything a socket has buffered, so that a socket whose
+ * receive side is shut down does not hold back the peer
+ *
+ * @this {TcpSocket}
+ */
+function discardInput(this: TcpSocket) {
+    while (this.read() !== null) {
+        // Discard
+    }
 }
 
 export function socketTcpSetKeepAlive(id: number, { keepAlive, keepAliveIdleTime }) {

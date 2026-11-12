@@ -201,6 +201,7 @@ export interface Stream {
     flushPromise: Promise<void> | null;
     pollState;
     fileResourceId?: number;
+    shutdown?: boolean;
 }
 
 export interface Future {
@@ -302,10 +303,12 @@ function streamError(err) {
 }
 
 /**
+ * Looks up a stream without checking whether it can still be used
+ *
  * @param {number} streamId
- * @returns {{ stream: NodeJS.ReadableStream | NodeJS.WritableStream, polls: number[] }}
+ * @returns {Stream}
  */
-export function getStreamOrThrow(streamId) {
+function getStreamRecordOrThrow(streamId) {
     if (!streamId) {
         throw new Error("wasi-io trap: no stream id provided");
     }
@@ -314,13 +317,54 @@ export function getStreamOrThrow(streamId) {
     if (!stream) {
         throw { tag: "closed" };
     }
+    return stream;
+}
+
+/**
+ * Throws the stream error that an operation reports once the guest has shut
+ * the stream down, or once its Node stream has failed or closed.
+ *
+ * @param {Stream} stream
+ */
+function throwIfStreamDone(stream) {
+    if (stream.shutdown) {
+        throw { tag: "closed" };
+    }
     if (stream.stream.errored) {
         throw streamError(stream.stream.errored);
     }
     if (stream.stream.closed) {
         throw { tag: "closed" };
     }
+}
+
+/**
+ * @param {number} streamId
+ * @returns {Stream}
+ */
+export function getStreamOrThrow(streamId) {
+    const stream = getStreamRecordOrThrow(streamId);
+    throwIfStreamDone(stream);
     return stream;
+}
+
+/**
+ * Closes a stream for the guest when it shuts down that direction of a
+ * socket, while the Node stream stays open for the other direction.
+ * Operations on the stream then report `closed`, and its pollables stay
+ * ready because those operations no longer wait
+ *
+ * @param {number | null} streamId
+ */
+export function shutdownStream(streamId) {
+    const stream = streamId === null ? undefined : streams.get(streamId);
+    if (!stream || stream.shutdown) {
+        return;
+    }
+    stream.shutdown = true;
+    // Stop `pollStateCheck` from waiting on the Node stream for this poll
+    stream.pollState.parentStream = null;
+    pollStateReady(stream.pollState);
 }
 
 const extensions = new Map<string, Promise<WorkerExtension>>();
@@ -684,7 +728,13 @@ function handle(call, id, payload) {
     // Generic call implementations (streams + polls)
     switch (call & CALL_MASK) {
         case INPUT_STREAM_READ: {
-            const stream = getStreamOrThrow(id);
+            const stream = getStreamRecordOrThrow(id);
+            // Like POSIX `recv`, return bytes that arrived before the stream
+            // failed or closed and report the failure once they have all
+            // been read. A receive shutdown discards buffered bytes instead
+            if (stream.shutdown || stream.stream.readableLength === 0) {
+                throwIfStreamDone(stream);
+            }
             if (!stream.pollState.ready) {
                 return new Uint8Array();
             }
